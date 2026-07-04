@@ -100,8 +100,30 @@ __global__ void qk_scores(const float* q, const float* k, float* scores, int seq
     
 }
 
-# Step 10 - softmax_rows (not yet solved)
-# TODO: implement
+# Step 10 - softmax_rows
+__global__ void softmax_rows(float* matrix, int rows, int cols) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+
+    float max =-INFINITY;
+    for (int c = 0; c < cols; c++){
+        float val = matrix[r*cols+c];
+            if (max < val){
+                max = val;
+            }
+    }
+    __syncthreads(); 
+    
+    float sum = 0;
+    for (int c = 0; c < cols; c++){
+        sum += expf(matrix[r*cols+c] - max);
+    }
+    __syncthreads(); 
+    for (int c = 0; c < cols; c++){
+        matrix[r*cols+c] = (expf(matrix[r*cols+c] - max))/sum;
+    } 
+    __syncthreads(); 
+}
 
 # Step 11 - pv_matmul (not yet solved)
 # TODO: implement
