@@ -160,8 +160,15 @@ pv_matmul<<<numBlocksOut, threadsPerBlock>>>(d_scores, d_v, d_out, seq_len, head
 cudaFree(d_scores);
 }
 
-# Step 13 - online_max (not yet solved)
-# TODO: implement
+# Step 13 - online_max
+__device__ float online_max(float old_max, float new_val) {
+    if (old_max < new_val){
+        return new_val;
+    }
+    else {
+        return old_max;
+    }
+}
 
 # Step 14 - correction_factor (not yet solved)
 # TODO: implement
