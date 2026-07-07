@@ -413,6 +413,86 @@ __device__ void causal_mask(float* s_tile, int q_row_start, int k_col_start,
     }
 }
 
-# Step 26 - flash_attention_causal_kernel (not yet solved)
-# TODO: implement
+# Step 26 - flash_attention_causal_kernel
+__global__ void flash_attention_causal_kernel(const float* q, const float* k, const float* v,
+                                                float* out, int seq_len, int head_dim,
+                                                int tile_q, int tile_k, float scale) {
+    extern __shared__ float smem[];
+    float* q_tile = smem;
+    float* k_tile = q_tile + tile_q * head_dim;
+    float* v_tile = k_tile + tile_k * head_dim;
+    float* s_tile = v_tile + tile_k * head_dim;
+    float* acc    = s_tile + tile_q * tile_k;
+    float* m      = acc + tile_q * head_dim;
+    float* l      = m + tile_q;
+    float* tmp    = l + tile_q;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int q_row_start = blockIdx.x * tile_q;
+    int last_query_row = q_row_start + tile_q - 1;
+
+    load_tile(q, q_tile, q_row_start, 0, seq_len, head_dim, tile_q, head_dim, tid, num_threads);
+    for (int row = tid; row < tile_q; row += num_threads) {
+        m[row] = -INFINITY;
+        l[row] = 0.0f;
+    }
+    for (int idx = tid; idx < tile_q * head_dim; idx += num_threads) {
+        acc[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k_start = 0; k_start < seq_len; k_start += tile_k) {
+        if (k_start > last_query_row) break;
+
+        load_tile(k, k_tile, k_start, 0, seq_len, head_dim, tile_k, head_dim, tid, num_threads);
+        load_tile(v, v_tile, k_start, 0, seq_len, head_dim, tile_k, head_dim, tid, num_threads);
+        __syncthreads();
+
+        tile_scores(q_tile, k_tile, s_tile, tile_q, tile_k, head_dim, scale, tid, num_threads);
+        __syncthreads();
+
+        causal_mask(s_tile, q_row_start, k_start, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        tile_rowmax(s_tile, tmp, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        for (int row = tid; row < tile_q; row += num_threads) {
+            tmp[row] = online_max(m[row], tmp[row]);
+        }
+        __syncthreads();
+
+        tile_exp(s_tile, tmp, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        for (int row = tid; row < tile_q; row += num_threads) {
+            float correction = correction_factor(m[row], tmp[row]);
+            rescale_output(&acc[row * head_dim], head_dim, correction);
+            l[row] *= correction;
+            m[row] = tmp[row];
+        }
+        __syncthreads();
+
+        tile_rowsum(s_tile, tmp, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        for (int row = tid; row < tile_q; row += num_threads) {
+            l[row] += tmp[row];
+        }
+        __syncthreads();
+
+        accumulate_pv(s_tile, v_tile, acc, tile_q, tile_k, head_dim, tid, num_threads);
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < tile_q * head_dim; idx += num_threads) {
+        int row = idx / head_dim;
+        int d = idx % head_dim;
+        int qi = q_row_start + row;
+        if (qi < seq_len) {
+            out[qi * head_dim + d] = acc[row * head_dim + d] / l[row];
+        }
+    }
+}
 
