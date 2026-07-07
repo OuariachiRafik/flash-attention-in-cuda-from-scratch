@@ -296,14 +296,116 @@ __device__ void accumulate_pv(const float* p_tile, const float* v_tile, float* o
     }
 }
 
-# Step 23 - flash_attention_kernel (not yet solved)
-# TODO: implement
+# Step 23 - flash_attention_kernel
+__global__ void flash_attention_kernel(const float* q, const float* k, const float* v,
+                                       float* out, int seq_len, int head_dim,
+                                       int tile_q, int tile_k, float scale) {
+    extern __shared__ float smem[];
+    float* q_tile = smem;
+    float* k_tile = q_tile + tile_q * head_dim;
+    float* v_tile = k_tile + tile_k * head_dim;
+    float* s_tile = v_tile + tile_k * head_dim;
+    float* acc    = s_tile + tile_q * tile_k;
+    float* m      = acc + tile_q * head_dim;
+    float* l      = m + tile_q;
+    float* tmp    = l + tile_q;
 
-# Step 24 - flash_attention_launcher (not yet solved)
-# TODO: implement
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int q_row_start = blockIdx.x * tile_q;
 
-# Step 25 - causal_mask (not yet solved)
-# TODO: implement
+    load_tile(q, q_tile, q_row_start, 0, seq_len, head_dim, tile_q, head_dim, tid, num_threads);
+    for (int row = tid; row < tile_q; row += num_threads) {
+        m[row] = -INFINITY;
+        l[row] = 0.0f;
+    }
+    for (int idx = tid; idx < tile_q * head_dim; idx += num_threads) {
+        acc[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k_start = 0; k_start < seq_len; k_start += tile_k) {
+        load_tile(k, k_tile, k_start, 0, seq_len, head_dim, tile_k, head_dim, tid, num_threads);
+        load_tile(v, v_tile, k_start, 0, seq_len, head_dim, tile_k, head_dim, tid, num_threads);
+        __syncthreads();
+
+        tile_scores(q_tile, k_tile, s_tile, tile_q, tile_k, head_dim, scale, tid, num_threads);
+        __syncthreads();
+
+        tile_rowmax(s_tile, tmp, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        for (int row = tid; row < tile_q; row += num_threads) {
+            tmp[row] = online_max(m[row], tmp[row]);
+        }
+        __syncthreads();
+
+        tile_exp(s_tile, tmp, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        for (int row = tid; row < tile_q; row += num_threads) {
+            float correction = correction_factor(m[row], tmp[row]);
+            rescale_output(&acc[row * head_dim], head_dim, correction);
+            l[row] *= correction;
+            m[row] = tmp[row];
+        }
+        __syncthreads();
+
+        tile_rowsum(s_tile, tmp, tile_q, tile_k, tid, num_threads);
+        __syncthreads();
+
+        for (int row = tid; row < tile_q; row += num_threads) {
+            l[row] += tmp[row];
+        }
+        __syncthreads();
+
+        accumulate_pv(s_tile, v_tile, acc, tile_q, tile_k, head_dim, tid, num_threads);
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < tile_q * head_dim; idx += num_threads) {
+        int row = idx / head_dim;
+        int d = idx % head_dim;
+        int qi = q_row_start + row;
+        if (qi < seq_len) {
+            out[qi * head_dim + d] = acc[row * head_dim + d] / l[row];
+        }
+    }
+}
+
+# Step 24 - flash_attention_launcher
+void flash_attention_launcher(const float* d_q, const float* d_k, const float* d_v,
+                              float* d_out, int seq_len, int head_dim,
+                              int tile_q, int tile_k) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int threadsPerBlock = 128;
+    int numBlocks = (seq_len + tile_q - 1) / tile_q;
+
+    size_t shmem_bytes = (tile_q * head_dim
+                        + tile_k * head_dim
+                        + tile_k * head_dim
+                        + tile_q * tile_k
+                        + tile_q * head_dim
+                        + 3 * tile_q) * sizeof(float);
+
+    flash_attention_kernel<<<numBlocks, threadsPerBlock, shmem_bytes>>>(
+        d_q, d_k, d_v, d_out, seq_len, head_dim, tile_q, tile_k, scale);
+}
+
+# Step 25 - causal_mask
+__device__ void causal_mask(float* s_tile, int q_row_start, int k_col_start,
+                            int tile_q, int tile_k, int thread_id, int num_threads) {
+    int total = tile_q * tile_k;
+    for (int idx = thread_id; idx < total; idx += num_threads) {
+        int row = idx / tile_k;
+        int col = idx % tile_k;
+        int global_q = q_row_start + row;
+        int global_k = k_col_start + col;
+        if (global_k > global_q) {
+            s_tile[idx] = -INFINITY;
+        }
+    }
+}
 
 # Step 26 - flash_attention_causal_kernel (not yet solved)
 # TODO: implement
