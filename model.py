@@ -332,6 +332,12 @@ __global__ void flash_attention_kernel(const float* q, const float* k, const flo
         tile_scores(q_tile, k_tile, s_tile, tile_q, tile_k, head_dim, scale, tid, num_threads);
         __syncthreads();
 
+        int rows_in_tile = min(tile_k, seq_len - k_start);
+        for (int idx = tid; idx < tile_q * tile_k; idx += num_threads) {
+            if ((idx % tile_k) >= rows_in_tile) s_tile[idx] = -INFINITY;
+        }
+        __syncthreads();
+
         tile_rowmax(s_tile, tmp, tile_q, tile_k, tid, num_threads);
         __syncthreads();
 
